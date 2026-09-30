@@ -188,6 +188,12 @@ type
     FLastWarning: EZSQLWarning;
     FEventList: TZFirebirdInterbaseEventList;
     FConnectionLost: Boolean;
+    { Ello/TT-4102: o tokenizer e o analisador eram construidos a cada chamada,
+      e LoadColumns chama os dois em toda abertura de consulta. Construir o
+      tokenizer custa ~0,25 ms (arvore de simbolos de 256 filhos). Sao objetos
+      sem estado de parse, entao uma instancia por conexao basta. }
+    FTokenizer: IZTokenizer;
+    FStatementAnalyser: IZStatementAnalyser;
     procedure DetermineClientTypeAndVersion;
     procedure AssignISC_Parameters;
     procedure TransactionParameterPufferChanged;
@@ -1894,7 +1900,9 @@ end;
 
 function TZInterbaseFirebirdConnection.GetStatementAnalyser: IZStatementAnalyser;
 begin
-  Result := TZInterbaseStatementAnalyser.Create;
+  if FStatementAnalyser = nil then
+    FStatementAnalyser := TZInterbaseStatementAnalyser.Create;
+  Result := FStatementAnalyser;
 end;
 
 function TZInterbaseFirebirdConnection.GetSubTypeTextCharSetID(const TableName,
@@ -1929,7 +1937,9 @@ end;
 
 function TZInterbaseFirebirdConnection.GetTokenizer: IZTokenizer;
 begin
-  Result := TZInterbaseTokenizer.Create;
+  if FTokenizer = nil then
+    FTokenizer := TZInterbaseTokenizer.Create;
+  Result := FTokenizer;
 end;
 
 function TZInterbaseFirebirdConnection.GetConnection: IZConnection;
@@ -2635,38 +2645,83 @@ end;
 {**
   Initializes columns with additional data.
 }
+{ Ello/TT-4102: a versao original varria TODAS as colunas da tabela para CADA
+  coluda da consulta -- laco quadratico. Num SELECT * de uma tabela de 79
+  colunas isso da ate 6.241 comparacoes, cada uma materializando uma string,
+  a cada abertura de consulta.
+
+  Agora as colunas sao agrupadas por tabela e cada tabela e varrida UMA vez,
+  casando por busca binaria numa lista ordenada. Mesmo resultado: as mesmas
+  colunas recebem FillColumInfoFromGetColumnsRS com a mesma linha do catalogo. }
 procedure TZInterbaseFirebirdResultSetMetadata.LoadColumns;
 var
   Current: TZColumnInfo;
-  I: Integer;
+  I, J: Integer;
   TableColumns: IZResultSet;
   Connection: IZConnection;
   IdentifierConverter: IZIdentifierConverter;
   Analyser: IZStatementAnalyser;
   Tokenizer: IZTokenizer;
+  Tabelas, Pendentes: TStringList;
+  NomeDaColuna: String;
 begin
   Connection := Metadata.GetConnection;
   Analyser := Connection.GetStatementAnalyser;
   Tokenizer := Connection.GetTokenizer;
   IdentifierConverter := Metadata.GetIdentifierConverter;
+  Tabelas := nil;
   try
-    if Analyser.DefineSelectSchemaFromQuery(Tokenizer, SQL) <> nil then
+    if Analyser.DefineSelectSchemaFromQuery(Tokenizer, SQL) <> nil then begin
+      { agrupa as colunas da consulta por tabela }
+      Tabelas := TStringList.Create;
+      Tabelas.CaseSensitive := True;
+      Tabelas.Sorted := True;
       for I := 0 to ResultSet.ColumnsInfo.Count - 1 do begin
         Current := TZColumnInfo(ResultSet.ColumnsInfo[i]);
         ClearColumn(Current);
         if Current.TableName = '' then
           continue;
-        TableColumns := Metadata.GetColumns(Current.CatalogName, Current.SchemaName, Metadata.AddEscapeCharToWildcards(IdentifierConverter.Quote(Current.TableName, iqTable)),'');
-        if TableColumns <> nil then begin
-          TableColumns.BeforeFirst;
-          while TableColumns.Next do
-            if TableColumns.GetString(ColumnNameIndex) = Current.ColumnName then begin
-              FillColumInfoFromGetColumnsRS(Current, TableColumns, Current.ColumnName);
-              Break;
-            end;
+        J := Tabelas.IndexOf(Current.TableName);
+        if J < 0 then begin
+          Pendentes := TStringList.Create;
+          Pendentes.CaseSensitive := True;
+          Pendentes.Sorted := True;
+          Pendentes.Duplicates := dupAccept;
+          J := Tabelas.AddObject(Current.TableName, Pendentes);
         end;
+        TStringList(Tabelas.Objects[J]).AddObject(Current.ColumnName, Current);
       end;
+
+      { uma varredura do catalogo por tabela }
+      for I := 0 to Tabelas.Count - 1 do begin
+        Pendentes := TStringList(Tabelas.Objects[I]);
+        if Pendentes.Count = 0 then
+          Continue;
+        Current := TZColumnInfo(Pendentes.Objects[0]);
+        TableColumns := Metadata.GetColumns(Current.CatalogName, Current.SchemaName, Metadata.AddEscapeCharToWildcards(IdentifierConverter.Quote(Tabelas[I], iqTable)),'');
+        if TableColumns = nil then
+          Continue;
+        TableColumns.BeforeFirst;
+        while TableColumns.Next and (Pendentes.Count > 0) do begin
+          NomeDaColuna := TableColumns.GetString(ColumnNameIndex);
+          J := Pendentes.IndexOf(NomeDaColuna);
+          { a mesma coluna pode aparecer mais de uma vez na consulta }
+          while J >= 0 do begin
+            Current := TZColumnInfo(Pendentes.Objects[J]);
+            FillColumInfoFromGetColumnsRS(Current, TableColumns, Current.ColumnName);
+            Pendentes.Delete(J);
+            J := Pendentes.IndexOf(NomeDaColuna);
+          end;
+        end;
+        TableColumns := nil;
+      end;
+    end;
   finally
+    if Tabelas <> nil then begin
+      for I := 0 to Tabelas.Count - 1 do
+        Tabelas.Objects[I].Free;
+      Tabelas.Free;
+    end;
     Connection := nil;
     Analyser := nil;
     Tokenizer := nil;
