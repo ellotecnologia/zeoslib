@@ -374,6 +374,10 @@ implementation
 uses
   ZMessages, ZExprToken, ZVariables, ZFunctions, ZMatchPattern;
 
+var
+  { criada na inicializacao da unit: sem corrida entre threads }
+  FuncoesPadraoCompartilhadas: IZFunctionsList;
+
 { TZExecutionStack }
 
 constructor TZExecutionStack.Create;
@@ -460,7 +464,13 @@ constructor TZExpression.Create;
 begin
   FTokenizer := TZExpressionTokenizer.Create;
   FDefaultVariables := TZVariablesList.Create;
-  FDefaultFunctions := TZDefaultFunctionsList.Create;
+  { Ello/TT-4102: montar a lista de funcoes padrao registra 134 funcoes, cada
+    registro com um UpperCase e uma varredura linear para detectar duplicata
+    -- 4.186 comparacoes. Isso rodava no construtor de TODO TZQuery
+    (ZAbstractRODataset.pas cria um TZExpression para o filtro), mesmo sem
+    filtro nenhum. A lista e imutavel depois de montada e as funcoes nao tem
+    estado, entao uma instancia por processo serve. }
+  FDefaultFunctions := FuncoesPadraoCompartilhadas;
   FVariantManager := TZSoftVariantManager.Create;
   FParser := TZExpressionParser.Create(FTokenizer);
   FAutoVariables := True;
@@ -760,5 +770,11 @@ begin
     raise TZExpressionError.Create(SInternalError);
   Result := Stack.Pop;
 end;
+
+initialization
+  FuncoesPadraoCompartilhadas := TZDefaultFunctionsList.Create;
+
+finalization
+  FuncoesPadraoCompartilhadas := nil;
 
 end.
